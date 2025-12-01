@@ -33,6 +33,32 @@ extern SDL_DECLSPEC char ** SDLCALL SDL_GetRemapperProfileList(int *count);
 /* Free a profile list returned by SDL_GetRemapperProfileList */
 extern SDL_DECLSPEC void SDLCALL SDL_FreeRemapperProfileList(char **list, int count);
 
+/* ===== Convenience Functions for Auto-Loading ===== */
+
+/* Load a profile by name (automatically adds .profile extension).
+ * Returns NULL if profile doesn't exist. */
+extern SDL_DECLSPEC SDL_RemapperProfile * SDLCALL SDL_LoadRemapperProfileByName(const char *name);
+
+/* Load a profile by name and apply it to a gamepad in one call.
+ * If the profile doesn't exist, creates a passthrough profile with that name.
+ * Returns 0 on success, -1 on error. */
+extern SDL_DECLSPEC int SDLCALL SDL_ApplyRemapperProfileByName(SDL_RemapperContext *ctx,
+                                                                SDL_JoystickID gamepad_id,
+                                                                const char *profile_name);
+
+/* Create a new passthrough profile with the given name and save it.
+ * Returns 0 on success, -1 on error. */
+extern SDL_DECLSPEC int SDLCALL SDL_CreateRemapperProfileWithName(SDL_JoystickID gamepad_id,
+                                                                   const char *name);
+
+/* Check if a profile with the given name exists.
+ * Returns true if the profile file exists, false otherwise. */
+extern SDL_DECLSPEC bool SDLCALL SDL_RemapperProfileExists(const char *name);
+
+/* Delete a profile file by name.
+ * Returns 0 on success, -1 on error. */
+extern SDL_DECLSPEC int SDLCALL SDL_DeleteRemapperProfileByName(const char *name);
+
 #ifdef __cplusplus
 }
 #endif

@@ -190,6 +190,11 @@ static int g_ui_active_profile_index = 0;
 static float g_ui_profile_trigger_deadzone_left[SDL_UI_MAX_PROFILES];
 static float g_ui_profile_trigger_deadzone_right[SDL_UI_MAX_PROFILES];
 
+/* Quick-start flags for SDL_EditDeviceProfile - set before calling SDL_ShowGamepadRemappingWindow */
+static bool g_edit_mode_active = false;
+static UIDeviceType g_edit_device_type = UI_DEVICE_TYPE_GAMEPAD;
+static char g_edit_profile_name[64] = {0};
+
 /* One candidate mapping option in the Mapping Selection dialog */
 typedef struct MappingOption
 {
@@ -2444,6 +2449,9 @@ UI_HandleGamepadNavButton(SDL_RemapperContext *ctx,
                     /* Yes - delete the profile */
                     int p = state->selected_profile;
                     if (p > 0 && p < state->profile_count && state->profile_count > 1) {
+                        /* Delete the profile file from disk first */
+                        SDL_DeleteRemapperProfileByName(state->profile_names[p]);
+
                         /* Shift profiles down (names, mappings, and trigger deadzones) */
                         for (int i = p; i < state->profile_count - 1; i++) {
                             SDL_strlcpy(state->profile_names[i], state->profile_names[i + 1], 64);
@@ -3964,7 +3972,7 @@ static float DrawButtonAuto(SDL_Renderer *r, const char *text, float x, float y,
 static void DrawDeviceSelectPage(SDL_Renderer *r, UIState *state, int w, int h)
 {
     /* Title in upper-left - left-aligned with margin from screen edge */
-    DrawTextLeft(r, "Accessories", ScaleX(40.0f, w), ScaleY(120.0f, h), ScaleY(60.0f, h), 255, 255, 255, 255);
+    DrawTextLeft(r, "Devices", ScaleX(40.0f, w), ScaleY(120.0f, h), ScaleY(60.0f, h), 255, 255, 255, 255);
 
     if (!state || state->device_count <= 0) {
         DrawText(r, "No devices detected", w / 2.0f, h / 2.0f, ScaleY(48.0f, h), 200, 200, 200, 255);
@@ -4030,11 +4038,11 @@ static void DrawDeviceSelectPage(SDL_Renderer *r, UIState *state, int w, int h)
     /* Configure button centered below the card - same height as other buttons */
     float btn_h = 50.0f;
     float btn_padding = 20.0f;
-    float btn_w = CalcButtonWidth("CONFIGURE", btn_h, btn_padding);
+    float btn_w = CalcButtonWidth("EDIT", btn_h, btn_padding);
     float btn_x = (float)w * 0.5f - btn_w * 0.5f;
     float btn_y = card_y + card_h + ScaleY(80.0f, h);  /* Moved down slightly */
     bool config_focused = (state && !state->device_back_focused);
-    DrawButton(r, "CONFIGURE", btn_x, btn_y, btn_w, btn_h, false, config_focused);
+    DrawButton(r, "EDIT", btn_x, btn_y, btn_w, btn_h, false, config_focused);
 
     /* Simple left/right selectors to hint at multiple devices */
     if (state->device_count > 1) {
@@ -5882,10 +5890,11 @@ static void LoadAllPageImages(SDL_Renderer *renderer)
 }
 
 /* Main UI function */
-int SDL_ShowGamepadRemappingWindow_REAL(SDL_RemapperContext *ctx, SDL_JoystickID gamepad_id)
+int SDL_ShowGamepadRemappingWindow_REAL(SDL_RemapperContext *ctx, SDL_JoystickID gamepad_id, SDL_Renderer *ext_renderer)
 {
-    SDL_Window *window;
-    SDL_Renderer *renderer;
+    SDL_Window *window = NULL;
+    SDL_Renderer *renderer = ext_renderer;
+    bool owns_window = false;  /* true if we created the window ourselves */
     SDL_Event event;
     bool done = false;
     UIState state = {0};
@@ -5948,14 +5957,93 @@ int SDL_ShowGamepadRemappingWindow_REAL(SDL_RemapperContext *ctx, SDL_JoystickID
      * the currently selected profile to the remapper context. */
     UI_LoadProfilesFromDisk(ctx, active_gamepad_id, &state);
 
-    /* Create window (title used to verify that remapper_app is loading this SDL3 UI build) */
-    window = SDL_CreateWindow("Gamepad Remapper - SDL C UI", 1280, 720, SDL_WINDOW_RESIZABLE);
-    if (!window) return -1;
+    /* Quick-start edit mode: jump directly to mapping page for specific device/profile */
+    if (g_edit_mode_active) {
+        /* Find the requested device type */
+        for (int i = 0; i < state.device_count; i++) {
+            if (state.device_types[i] == g_edit_device_type) {
+                state.selected_device = i;
+                break;
+            }
+        }
 
-    renderer = SDL_CreateRenderer(window, NULL);
-    if (!renderer) {
-        SDL_DestroyWindow(window);
-        return -1;
+        /* Find the requested profile by name (handles underscores vs spaces) */
+        if (g_edit_profile_name[0] != '\0') {
+            /* Convert search name: underscores to spaces for comparison */
+            char search_name[64];
+            SDL_strlcpy(search_name, g_edit_profile_name, sizeof(search_name));
+            for (int j = 0; search_name[j]; j++) {
+                if (search_name[j] == '_') search_name[j] = ' ';
+            }
+
+            for (int i = 0; i < state.profile_count; i++) {
+                /* Try exact match first, then underscore->space match */
+                if (SDL_strcmp(state.profile_names[i], g_edit_profile_name) == 0 ||
+                    SDL_strcmp(state.profile_names[i], search_name) == 0) {
+                    state.selected_profile = i;
+                    g_ui_active_profile_index = i;
+                    break;
+                }
+            }
+        }
+
+        /* Jump directly to the button mapping page */
+        state.current_page = PAGE_BUTTON_MAPPING;
+
+        /* Clear the edit mode flag */
+        g_edit_mode_active = false;
+        g_edit_profile_name[0] = '\0';
+    }
+
+    /* Use provided renderer or create our own window */
+    SDL_Window *parent_window = NULL;  /* For syncing our window to parent when owns_window is true */
+
+    if (ext_renderer) {
+        /* Use the provided renderer - get its window */
+        renderer = ext_renderer;
+        window = SDL_GetRenderWindow(renderer);
+        owns_window = false;
+    } else {
+        /* Create our own borderless window */
+        int win_w = 0, win_h = 0;
+        int win_x = 0, win_y = 0;
+        bool use_fullscreen = false;
+
+        /* Try to get the focused window (the app that called us) and match its size/position */
+        parent_window = SDL_GetKeyboardFocus();
+        if (parent_window) {
+            SDL_GetWindowSize(parent_window, &win_w, &win_h);
+            SDL_GetWindowPosition(parent_window, &win_x, &win_y);
+        } else {
+            /* Fallback to fullscreen on primary display */
+            SDL_DisplayID display = SDL_GetPrimaryDisplay();
+            const SDL_DisplayMode *mode = SDL_GetCurrentDisplayMode(display);
+            if (mode) {
+                win_w = mode->w;
+                win_h = mode->h;
+            } else {
+                win_w = 1920;
+                win_h = 1080;
+            }
+            use_fullscreen = true;
+        }
+
+        window = SDL_CreateWindow("Gamepad Remapper", win_w, win_h, SDL_WINDOW_RESIZABLE | SDL_WINDOW_BORDERLESS);
+        if (!window) return -1;
+
+        /* Position window to match parent, or use fullscreen position (0,0) */
+        if (!use_fullscreen && win_x >= 0 && win_y >= 0) {
+            SDL_SetWindowPosition(window, win_x, win_y);
+        } else if (use_fullscreen) {
+            SDL_SetWindowPosition(window, 0, 0);
+        }
+
+        renderer = SDL_CreateRenderer(window, NULL);
+        if (!renderer) {
+            SDL_DestroyWindow(window);
+            return -1;
+        }
+        owns_window = true;
     }
 
     /* Load all icons (controller, mouse, keyboard) and background images */
@@ -5965,6 +6053,24 @@ int SDL_ShowGamepadRemappingWindow_REAL(SDL_RemapperContext *ctx, SDL_JoystickID
     while (!done) {
         int w, h;
         SDL_GetCurrentRenderOutputSize(renderer, &w, &h);
+
+        /* Sync window size/position with parent window if we created our own window */
+        if (owns_window && parent_window) {
+            int parent_w, parent_h, parent_x, parent_y;
+            SDL_GetWindowSize(parent_window, &parent_w, &parent_h);
+            SDL_GetWindowPosition(parent_window, &parent_x, &parent_y);
+
+            int cur_w, cur_h, cur_x, cur_y;
+            SDL_GetWindowSize(window, &cur_w, &cur_h);
+            SDL_GetWindowPosition(window, &cur_x, &cur_y);
+
+            if (cur_w != parent_w || cur_h != parent_h) {
+                SDL_SetWindowSize(window, parent_w, parent_h);
+            }
+            if (cur_x != parent_x || cur_y != parent_y) {
+                SDL_SetWindowPosition(window, parent_x, parent_y);
+            }
+        }
 
         /* Event handling */
         while (SDL_PollEvent(&event)) {
@@ -7574,8 +7680,234 @@ int SDL_ShowGamepadRemappingWindow_REAL(SDL_RemapperContext *ctx, SDL_JoystickID
         }
     }
 
-    SDL_DestroyRenderer(renderer);
-    SDL_DestroyWindow(window);
+    /* Only destroy renderer/window if we created them */
+    if (owns_window) {
+        SDL_DestroyRenderer(renderer);
+        SDL_DestroyWindow(window);
+    }
 
     return 0;
+}
+
+/* Edit a specific profile directly - for "Edit Controls" buttons.
+ * This sets flags and calls the full UI which will jump to the correct page. */
+int SDL_EditDeviceProfile_REAL(SDL_RemapperContext *ctx, SDL_RemapperDeviceType device_type,
+                                SDL_Renderer *renderer, const char *profile_name)
+{
+    if (!profile_name || !*profile_name) {
+        return SDL_InvalidParamError("profile_name");
+    }
+
+    /* Set quick-start flags */
+    g_edit_mode_active = true;
+
+    switch (device_type) {
+    case SDL_REMAPPER_DEVICE_MOUSE:
+        g_edit_device_type = UI_DEVICE_TYPE_MOUSE;
+        break;
+    case SDL_REMAPPER_DEVICE_KEYBOARD:
+        g_edit_device_type = UI_DEVICE_TYPE_KEYBOARD;
+        break;
+    case SDL_REMAPPER_DEVICE_GAMEPAD:
+    default:
+        g_edit_device_type = UI_DEVICE_TYPE_GAMEPAD;
+        break;
+    }
+
+    SDL_strlcpy(g_edit_profile_name, profile_name, sizeof(g_edit_profile_name));
+
+    /* Call the full UI - it will use the flags to jump to the right place */
+    return SDL_ShowGamepadRemappingWindow(ctx, 0, renderer);
+}
+
+/* Convenience wrapper - edit a gamepad profile */
+int SDL_EditGamepadProfile_REAL(SDL_RemapperContext *ctx, SDL_JoystickID gamepad_id,
+                                 SDL_Renderer *renderer, const char *profile_name)
+{
+    (void)gamepad_id;  /* Not used - device is determined by device_type */
+    return SDL_EditDeviceProfile(ctx, SDL_REMAPPER_DEVICE_GAMEPAD, renderer, profile_name);
+}
+
+/* ===== Advanced Overlay API Implementation ===== */
+
+/* The overlay UI structure - holds all state needed for overlay rendering */
+struct SDL_RemapperUI {
+    SDL_RemapperContext *ctx;
+    SDL_JoystickID gamepad_id;
+    UIState state;
+    bool should_close;
+    bool icons_loaded;
+};
+
+SDL_RemapperUI * SDLCALL SDL_CreateRemapperUI_REAL(SDL_RemapperContext *ctx, SDL_JoystickID gamepad_id)
+{
+    SDL_RemapperUI *ui = (SDL_RemapperUI *)SDL_calloc(1, sizeof(SDL_RemapperUI));
+    if (!ui) {
+        return NULL;
+    }
+
+    ui->ctx = ctx;
+    ui->gamepad_id = gamepad_id;
+    ui->should_close = false;
+    ui->icons_loaded = false;
+
+    /* Initialize state (same as SDL_ShowGamepadRemappingWindow) */
+    ui->state.current_page = PAGE_DEVICE_SELECT;
+    ui->state.device_count = 0;
+    ui->state.selected_device = 0;
+    ui->state.profile_count = 1;
+    SDL_strlcpy(ui->state.profile_names[0], "Default Profile", 64);
+    ui->state.selected_profile = 0;
+    ui->state.profile_list_scroll = 0;
+    ui->state.selected_button = SDL_GAMEPAD_BUTTON_INVALID;
+    ui->state.selected_axis = SDL_GAMEPAD_AXIS_INVALID;
+    ui->state.active_dialog = DIALOG_NONE;
+    ui->state.active_tab = 0;
+    ui->state.active_slot = 0;
+    ui->state.list_selection = 0;
+    ui->state.list_scroll = 0;
+    ui->state.trigger_deadzone_left = 50.0f;
+    ui->state.trigger_deadzone_right = 50.0f;
+    ui->state.mapping_from_trigger = false;
+    ui->state.dialog_read_only = false;
+
+    /* Navigation focus state */
+    ui->state.profile_focus_on_new_button = false;
+    ui->state.profile_action_focus = -1;
+    ui->state.profile_preview_index = -1;
+    ui->state.profile_mouse_origin_index = -1;
+    ui->state.profile_gamepad_origin_index = -1;
+    ui->state.mapping_action_focus = -1;
+    ui->state.mouse_mapping_origin_slot = -1;
+    ui->state.mapping_gamepad_origin_index = -1;
+    ui->state.keyboard_mapping_origin_slot = -1;
+    ui->state.dialog_focus_index = 0;
+    ui->state.nav_stick_x_dir = 0;
+    ui->state.nav_stick_y_dir = 0;
+
+    /* Initialize per-profile mappings */
+    UI_InitProfileMappings(0);
+    UI_InitGamepadPassthroughDefaultsForProfile(0);
+
+    /* Populate device list */
+    UI_InitDeviceList(&ui->state, gamepad_id);
+
+    /* Load profiles from disk */
+    UI_LoadProfilesFromDisk(ctx, gamepad_id, &ui->state);
+
+    return ui;
+}
+
+bool SDLCALL SDL_RemapperUI_HandleEvent_REAL(SDL_RemapperUI *ui, const SDL_Event *event)
+{
+    if (!ui || !event) {
+        return false;
+    }
+
+    bool consumed = false;
+    bool done = false;
+
+    /* Handle the event similar to the main loop in SDL_ShowGamepadRemappingWindow */
+    if (event->type == SDL_EVENT_KEY_DOWN) {
+        if (event->key.scancode == SDL_SCANCODE_ESCAPE) {
+            if (ui->state.active_dialog != DIALOG_NONE) {
+                ui->state.active_dialog = DIALOG_NONE;
+            } else if (ui->state.current_page == PAGE_BUTTON_MAPPING) {
+                ui->state.current_page = PAGE_PROFILE_SELECT;
+            } else if (ui->state.current_page == PAGE_PROFILE_SELECT) {
+                ui->state.current_page = PAGE_DEVICE_SELECT;
+            } else {
+                ui->should_close = true;
+            }
+            consumed = true;
+        }
+    } else if (event->type == SDL_EVENT_GAMEPAD_BUTTON_DOWN) {
+        UI_HandleGamepadNavButton(ui->ctx, ui->gamepad_id,
+                                   (SDL_GamepadButton)event->gbutton.button,
+                                   &ui->state, &done);
+        if (done) {
+            ui->should_close = true;
+        }
+        consumed = true;
+    } else if (event->type == SDL_EVENT_MOUSE_BUTTON_DOWN) {
+        /* Mouse click handling would go here - simplified for now */
+        consumed = true;
+    }
+
+    return consumed;
+}
+
+void SDLCALL SDL_RemapperUI_Draw_REAL(SDL_RemapperUI *ui, SDL_Renderer *renderer)
+{
+    if (!ui || !renderer) {
+        return;
+    }
+
+    /* Load icons on first draw (needs renderer) */
+    if (!ui->icons_loaded) {
+        UI_LoadAllIcons(renderer);
+        LoadAllPageImages(renderer);
+        ui->icons_loaded = true;
+    }
+
+    int w, h;
+    SDL_GetCurrentRenderOutputSize(renderer, &w, &h);
+
+    /* Draw semi-transparent overlay background */
+    SDL_SetRenderDrawBlendMode(renderer, SDL_BLENDMODE_BLEND);
+    SDL_SetRenderDrawColor(renderer, 0, 0, 0, 200);
+    SDL_FRect overlay = { 0, 0, (float)w, (float)h };
+    SDL_RenderFillRect(renderer, &overlay);
+
+    /* Draw the appropriate page */
+    if (ui->state.current_page == PAGE_DEVICE_SELECT) {
+        DrawDeviceSelectPage(renderer, &ui->state, w, h);
+    } else if (ui->state.current_page == PAGE_PROFILE_SELECT) {
+        DrawProfileSelectPage(renderer, &ui->state, w, h);
+    } else if (ui->state.current_page == PAGE_BUTTON_MAPPING) {
+        DrawButtonMappingPage(renderer, &ui->state, w, h);
+    }
+
+    /* Draw any active dialog on top */
+    if (ui->state.active_dialog == DIALOG_NEW_PROFILE ||
+        ui->state.active_dialog == DIALOG_RENAME_PROFILE) {
+        const char *title = (ui->state.active_dialog == DIALOG_NEW_PROFILE) ? "New Profile" : "Rename Profile";
+        DrawTextInputDialog(renderer, &ui->state, w, h, title);
+    } else if (ui->state.active_dialog == DIALOG_DELETE_CONFIRM) {
+        DrawDeleteConfirmDialog(renderer, &ui->state, w, h);
+    } else if (ui->state.active_dialog == DIALOG_BUTTON_OPTIONS) {
+        DrawButtonOptionsDialog(renderer, &ui->state, w, h);
+    } else if (ui->state.active_dialog == DIALOG_STICK_CONFIG ||
+               ui->state.active_dialog == DIALOG_MOUSE_MOVE_CONFIG) {
+        DrawStickConfigDialog(renderer, &ui->state, w, h);
+    } else if (ui->state.active_dialog == DIALOG_TRIGGER_OPTIONS) {
+        DrawTriggerOptionsDialog(renderer, &ui->state, w, h);
+    } else if (ui->state.active_dialog == DIALOG_MAPPING_SELECT) {
+        DrawMappingSelectDialog(renderer, &ui->state, w, h);
+    } else if (ui->state.active_dialog == DIALOG_VIRTUAL_KEYBOARD) {
+        DrawVirtualKeyboardDialog(renderer, &ui->state, w, h);
+    }
+
+    SDL_SetRenderDrawBlendMode(renderer, SDL_BLENDMODE_NONE);
+}
+
+bool SDLCALL SDL_RemapperUI_ShouldClose_REAL(SDL_RemapperUI *ui)
+{
+    if (!ui) {
+        return true;
+    }
+    return ui->should_close;
+}
+
+void SDLCALL SDL_DestroyRemapperUI_REAL(SDL_RemapperUI *ui)
+{
+    if (!ui) {
+        return;
+    }
+
+    /* Note: We don't destroy icons/textures here as they may be shared
+     * or the renderer may have already been destroyed. The app is responsible
+     * for renderer lifetime. */
+
+    SDL_free(ui);
 }

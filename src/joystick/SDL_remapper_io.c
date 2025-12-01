@@ -11,7 +11,7 @@
 
 static char *SDL_remapper_profiles_path = NULL;
 
-const char * SDLCALL SDL_GetRemapperProfilesPath(void)
+const char * SDLCALL SDL_GetRemapperProfilesPath_REAL(void)
 {
     if (!SDL_remapper_profiles_path) {
         char *pref_path = SDL_GetPrefPath("SDL", "GamepadRemapper");
@@ -91,8 +91,8 @@ ReadActionFromFile(SDL_IOStream *file, SDL_RemapperAction *action)
     }
 }
 
-int SDLCALL SDL_SaveRemapperProfile(const SDL_RemapperProfile *profile,
-                                    const char *filename)
+int SDLCALL SDL_SaveRemapperProfile_REAL(const SDL_RemapperProfile *profile,
+                                         const char *filename)
 {
     SDL_IOStream *file;
     char path[1024];
@@ -202,7 +202,7 @@ int SDLCALL SDL_SaveRemapperProfile(const SDL_RemapperProfile *profile,
     return 0;
 }
 
-SDL_RemapperProfile * SDLCALL SDL_LoadRemapperProfile(const char *filename)
+SDL_RemapperProfile * SDLCALL SDL_LoadRemapperProfile_REAL(const char *filename)
 {
     SDL_IOStream *file;
     SDL_RemapperProfile *profile;
@@ -633,7 +633,7 @@ SDL_RemapperProfile * SDLCALL SDL_LoadRemapperProfile(const char *filename)
     return profile;
 }
 
-void SDLCALL SDL_FreeRemapperProfile(SDL_RemapperProfile *profile)
+void SDLCALL SDL_FreeRemapperProfile_REAL(SDL_RemapperProfile *profile)
 {
     int i;
 
@@ -657,7 +657,7 @@ void SDLCALL SDL_FreeRemapperProfile(SDL_RemapperProfile *profile)
     SDL_free(profile);
 }
 
-char ** SDLCALL SDL_GetRemapperProfileList(int *count)
+char ** SDLCALL SDL_GetRemapperProfileList_REAL(int *count)
 {
     const char *profiles_path;
     char **globlist;
@@ -711,7 +711,7 @@ char ** SDLCALL SDL_GetRemapperProfileList(int *count)
     return result;
 }
 
-void SDLCALL SDL_FreeRemapperProfileList(char **list, int count)
+void SDLCALL SDL_FreeRemapperProfileList_REAL(char **list, int count)
 {
     int i;
 
@@ -726,4 +726,140 @@ void SDLCALL SDL_FreeRemapperProfileList(char **list, int count)
     }
 
     SDL_free(list);
+}
+
+/* ===== Convenience Functions for Auto-Loading ===== */
+
+SDL_RemapperProfile * SDLCALL SDL_LoadRemapperProfileByName_REAL(const char *name)
+{
+    char filename[256];
+
+    if (!name || !*name) {
+        SDL_InvalidParamError("name");
+        return NULL;
+    }
+
+    /* Build filename with .profile extension */
+    SDL_snprintf(filename, sizeof(filename), "%s.profile", name);
+
+    return SDL_LoadRemapperProfile(filename);
+}
+
+bool SDLCALL SDL_RemapperProfileExists_REAL(const char *name)
+{
+    char path[1024];
+    const char *profiles_path;
+    SDL_IOStream *file;
+
+    if (!name || !*name) {
+        return false;
+    }
+
+    profiles_path = SDL_GetRemapperProfilesPath();
+    if (!profiles_path) {
+        return false;
+    }
+
+    SDL_snprintf(path, sizeof(path), "%s%s.profile", profiles_path, name);
+
+    /* Try to open the file to check if it exists */
+    file = SDL_IOFromFile(path, "r");
+    if (file) {
+        SDL_CloseIO(file);
+        return true;
+    }
+
+    return false;
+}
+
+int SDLCALL SDL_CreateRemapperProfileWithName_REAL(SDL_JoystickID gamepad_id, const char *name)
+{
+    SDL_RemapperProfile *profile;
+    char filename[256];
+    int result;
+
+    if (!name || !*name) {
+        return SDL_InvalidParamError("name");
+    }
+
+    /* Create a passthrough profile */
+    profile = SDL_CreateGamepadPassthroughProfile(gamepad_id);
+    if (!profile) {
+        return -1;
+    }
+
+    /* Set the name (we need to allocate it since the profile will be freed) */
+    profile->name = SDL_strdup(name);
+
+    /* Build filename */
+    SDL_snprintf(filename, sizeof(filename), "%s.profile", name);
+
+    /* Save it */
+    result = SDL_SaveRemapperProfile(profile, filename);
+
+    SDL_FreeRemapperProfile(profile);
+
+    return result;
+}
+
+int SDLCALL SDL_ApplyRemapperProfileByName_REAL(SDL_RemapperContext *ctx,
+                                                 SDL_JoystickID gamepad_id,
+                                                 const char *profile_name)
+{
+    SDL_RemapperProfile *profile;
+    int result;
+
+    if (!ctx) {
+        return SDL_InvalidParamError("ctx");
+    }
+    if (!profile_name || !*profile_name) {
+        return SDL_InvalidParamError("profile_name");
+    }
+
+    /* Try to load existing profile */
+    profile = SDL_LoadRemapperProfileByName(profile_name);
+
+    if (!profile) {
+        /* Profile doesn't exist, create it */
+        if (SDL_CreateRemapperProfileWithName(gamepad_id, profile_name) < 0) {
+            return -1;
+        }
+
+        /* Now load the newly created profile */
+        profile = SDL_LoadRemapperProfileByName(profile_name);
+        if (!profile) {
+            return -1;
+        }
+    }
+
+    /* Apply the profile to the remapper context */
+    result = SDL_SetRemapperProfile(ctx, gamepad_id, profile);
+
+    SDL_FreeRemapperProfile(profile);
+
+    return result;
+}
+
+int SDLCALL SDL_DeleteRemapperProfileByName_REAL(const char *name)
+{
+    char path[1024];
+    const char *profiles_path;
+
+    if (!name || !*name) {
+        return SDL_InvalidParamError("name");
+    }
+
+    profiles_path = SDL_GetRemapperProfilesPath();
+    if (!profiles_path) {
+        return SDL_SetError("Failed to get profiles path");
+    }
+
+    SDL_snprintf(path, sizeof(path), "%s%s.profile", profiles_path, name);
+
+    /* Delete the file */
+    if (!SDL_RemovePath(path)) {
+        return SDL_SetError("Failed to delete profile '%s': %s", name, SDL_GetError());
+    }
+
+    return 0;
 }

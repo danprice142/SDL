@@ -75,6 +75,7 @@
 #include <SDL3/SDL_rect.h>
 #include <SDL3/SDL_render.h>
 #include <SDL3/SDL_remapper.h>
+#include <SDL3/SDL_remapper_io.h>
 #include <SDL3/SDL_scancode.h>
 #include <SDL3/SDL_sensor.h>
 #include <SDL3/SDL_storage.h>

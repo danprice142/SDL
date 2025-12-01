@@ -165,9 +165,66 @@ extern SDL_DECLSPEC int SDLCALL SDL_ProcessRemappedEvent(SDL_RemapperContext *ct
 extern SDL_DECLSPEC bool SDLCALL SDL_PollRemappedEvent(SDL_RemapperContext *ctx,
                                                       SDL_Event *event);
 
-/* Show an SDL-rendered controller remapping window for the given gamepad. */
+/* Show the remapper UI for the given gamepad.
+ * If renderer is provided, renders as an overlay in the renderer's window (blocking).
+ * If renderer is NULL, creates its own window (legacy behavior).
+ * The UI tracks and adapts to window size changes automatically. */
 extern SDL_DECLSPEC int SDLCALL SDL_ShowGamepadRemappingWindow(SDL_RemapperContext *ctx,
-                                                               SDL_JoystickID gamepad_id);
+                                                               SDL_JoystickID gamepad_id,
+                                                               SDL_Renderer *renderer);
+
+/* Device types for SDL_EditDeviceProfile */
+typedef enum SDL_RemapperDeviceType {
+    SDL_REMAPPER_DEVICE_GAMEPAD = 0,
+    SDL_REMAPPER_DEVICE_MOUSE = 1,
+    SDL_REMAPPER_DEVICE_KEYBOARD = 2
+} SDL_RemapperDeviceType;
+
+/* Show the remapper UI opened directly to a specific profile for editing.
+ * Perfect for "Edit Controls" buttons in game settings menus.
+ * device_type determines which device's controls are shown (gamepad/mouse/keyboard).
+ * If the profile doesn't exist, it will be created automatically.
+ * Returns 0 on success, -1 on error. */
+extern SDL_DECLSPEC int SDLCALL SDL_EditDeviceProfile(SDL_RemapperContext *ctx,
+                                                       SDL_RemapperDeviceType device_type,
+                                                       SDL_Renderer *renderer,
+                                                       const char *profile_name);
+
+/* Convenience function - same as SDL_EditDeviceProfile with SDL_REMAPPER_DEVICE_GAMEPAD */
+extern SDL_DECLSPEC int SDLCALL SDL_EditGamepadProfile(SDL_RemapperContext *ctx,
+                                                        SDL_JoystickID gamepad_id,
+                                                        SDL_Renderer *renderer,
+                                                        const char *profile_name);
+
+/* ===== Advanced Overlay API =====
+ * For apps that want to render the remapper UI as an overlay in their own window.
+ * This requires more integration but provides a seamless in-game experience.
+ */
+
+/* Opaque handle to the remapper UI overlay state */
+typedef struct SDL_RemapperUI SDL_RemapperUI;
+
+/* Create a remapper UI overlay. The caller is responsible for calling Draw and HandleEvent.
+ * Returns NULL on failure. */
+extern SDL_DECLSPEC SDL_RemapperUI * SDLCALL SDL_CreateRemapperUI(SDL_RemapperContext *ctx,
+                                                                   SDL_JoystickID gamepad_id);
+
+/* Process an SDL event. Returns true if the event was consumed by the remapper UI.
+ * Call this before your app's event handling - if it returns true, skip your handling. */
+extern SDL_DECLSPEC bool SDLCALL SDL_RemapperUI_HandleEvent(SDL_RemapperUI *ui,
+                                                             const SDL_Event *event);
+
+/* Draw the remapper UI overlay to the given renderer.
+ * Call this after your app's rendering but before SDL_RenderPresent(). */
+extern SDL_DECLSPEC void SDLCALL SDL_RemapperUI_Draw(SDL_RemapperUI *ui,
+                                                      SDL_Renderer *renderer);
+
+/* Check if the remapper UI wants to close (user pressed back/escape on main screen).
+ * Your app should call SDL_DestroyRemapperUI() when this returns true. */
+extern SDL_DECLSPEC bool SDLCALL SDL_RemapperUI_ShouldClose(SDL_RemapperUI *ui);
+
+/* Destroy the remapper UI overlay and free resources. */
+extern SDL_DECLSPEC void SDLCALL SDL_DestroyRemapperUI(SDL_RemapperUI *ui);
 
 /* ===== Profile/Mapping Getters ===== */
 
