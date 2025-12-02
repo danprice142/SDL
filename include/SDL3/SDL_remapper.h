@@ -183,7 +183,9 @@ typedef enum SDL_RemapperDeviceType {
 /* Show the remapper UI opened directly to a specific profile for editing.
  * Perfect for "Edit Controls" buttons in game settings menus.
  * device_type determines which device's controls are shown (gamepad/mouse/keyboard).
- * If the profile doesn't exist, it will be created automatically.
+ * profile_name can be NULL to use the current/default profile.
+ * If a profile name is specified but not found, falls back to the default profile.
+ * Back button on the remapping page will close the UI.
  * Returns 0 on success, -1 on error. */
 extern SDL_DECLSPEC int SDLCALL SDL_EditDeviceProfile(SDL_RemapperContext *ctx,
                                                        SDL_RemapperDeviceType device_type,
@@ -195,6 +197,56 @@ extern SDL_DECLSPEC int SDLCALL SDL_EditGamepadProfile(SDL_RemapperContext *ctx,
                                                         SDL_JoystickID gamepad_id,
                                                         SDL_Renderer *renderer,
                                                         const char *profile_name);
+
+/* Show the remapper UI opened directly to the profile management page.
+ * Similar to SDL_EditDeviceProfile but opens the profile page instead of the remapping page.
+ * profile_name can be NULL to use the current/default profile.
+ * If a profile name is specified but not found, falls back to the default profile.
+ * Back button on the profile page will close the UI, but navigating to the remapping page
+ * and pressing back will return to the profile page normally.
+ * Returns 0 on success, -1 on error. */
+extern SDL_DECLSPEC int SDLCALL SDL_OpenDeviceProfilePage(SDL_RemapperContext *ctx,
+                                                           SDL_RemapperDeviceType device_type,
+                                                           SDL_Renderer *renderer,
+                                                           const char *profile_name);
+
+/* ===== UI Visibility Configuration =====
+ * Control which parts of the remapper UI are visible.
+ * Useful for games that only support certain input types.
+ */
+
+/* Configuration for hiding parts of the remapper UI */
+typedef struct SDL_RemapperUIConfig {
+    /* Device visibility on device selection page */
+    bool show_gamepad_device;     /* Show gamepad in device list */
+    bool show_mouse_device;       /* Show mouse in device list */
+    bool show_keyboard_device;    /* Show keyboard in device list */
+    bool show_touch_device;       /* Show touch in device list */
+
+    /* Action type visibility in mapping selection dialog (tabs) */
+    bool show_gamepad_actions;    /* Controller buttons/axes tab */
+    bool show_mouse_actions;      /* Mouse buttons/wheel/movement tab */
+    bool show_keyboard_actions;   /* Keyboard keys tab */
+    bool show_touch_actions;      /* Touch actions tab */
+
+    /* Stick/Mouse Movement dialog options (checkboxes, toggles, sliders) */
+    bool show_stick_mouse_option;     /* "Use as Mouse" checkbox + sensitivity sliders */
+    bool show_stick_keyboard_options; /* "Use as WASD" and "Use as Arrow Keys" checkboxes */
+    bool show_stick_gamepad_options;  /* "Use as Controller Stick" + "Use as D-Pad" checkboxes */
+    bool show_stick_touch_option;     /* "Use as Touch Mouse" checkbox + finger selector */
+    bool show_stick_gyro_option;      /* "Use as Gyroscope" checkbox + gyro sliders */
+} SDL_RemapperUIConfig;
+
+/* Get a default configuration with all options enabled.
+ * Writes the default config to the provided pointer. */
+extern SDL_DECLSPEC void SDLCALL SDL_GetDefaultRemapperUIConfig(SDL_RemapperUIConfig *config);
+
+/* Set the UI visibility configuration. Takes effect on next UI open.
+ * Pass NULL to reset to defaults. */
+extern SDL_DECLSPEC void SDLCALL SDL_SetRemapperUIConfig(const SDL_RemapperUIConfig *config);
+
+/* Get the current UI visibility configuration */
+extern SDL_DECLSPEC const SDL_RemapperUIConfig * SDLCALL SDL_GetRemapperUIConfig(void);
 
 /* ===== Advanced Overlay API =====
  * For apps that want to render the remapper UI as an overlay in their own window.

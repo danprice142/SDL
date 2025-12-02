@@ -194,6 +194,28 @@ static float g_ui_profile_trigger_deadzone_right[SDL_UI_MAX_PROFILES];
 static bool g_edit_mode_active = false;
 static UIDeviceType g_edit_device_type = UI_DEVICE_TYPE_GAMEPAD;
 static char g_edit_profile_name[64] = {0};
+static UIPage g_edit_entry_page = PAGE_DEVICE_SELECT;  /* Entry page for quick-start mode */
+static UIPage g_active_entry_page = PAGE_DEVICE_SELECT; /* Currently active entry page (set during UI run) */
+
+/* UI visibility configuration - controls which parts of the UI are shown */
+static SDL_RemapperUIConfig g_ui_config = {
+    /* Device Selection Page */
+    true,  /* show_gamepad_device */
+    true,  /* show_mouse_device */
+    true,  /* show_keyboard_device */
+    true,  /* show_touch_device */
+    /* Action Lists (tabs in mapping dialog) */
+    true,  /* show_gamepad_actions */
+    true,  /* show_mouse_actions */
+    true,  /* show_keyboard_actions */
+    true,  /* show_touch_actions */
+    /* Stick/Mouse Movement Dialog Options */
+    true,  /* show_stick_mouse_option */
+    true,  /* show_stick_keyboard_options */
+    true,  /* show_stick_gamepad_options */
+    true,  /* show_stick_touch_option */
+    true   /* show_stick_gyro_option */
+};
 
 /* One candidate mapping option in the Mapping Selection dialog */
 typedef struct MappingOption
@@ -1286,11 +1308,78 @@ UI_FormatStickSummary(const SDL_RemapperStickMapping *stick, char *buffer, size_
     }
 }
 
-/* Helper: get currently active MappingOption table for the mapping dialog */
+/* Helper: check if an action tab is visible based on config */
+static bool UI_IsActionTabVisible(int tab)
+{
+    switch (tab) {
+    case 0: return g_ui_config.show_gamepad_actions;
+    case 1: return g_ui_config.show_mouse_actions;
+    case 2: return g_ui_config.show_keyboard_actions;
+    case 3: return g_ui_config.show_touch_actions;
+    default: return false;
+    }
+}
+
+/* Helper: get count of visible action tabs */
+static int UI_GetVisibleTabCount(void)
+{
+    int count = 0;
+    for (int i = 0; i < 4; i++) {
+        if (UI_IsActionTabVisible(i)) {
+            count++;
+        }
+    }
+    return count;
+}
+
+/* Helper: get first visible tab index */
+static int UI_GetFirstVisibleTab(void)
+{
+    for (int i = 0; i < 4; i++) {
+        if (UI_IsActionTabVisible(i)) {
+            return i;
+        }
+    }
+    return 0;
+}
+
+/* Helper: get next visible tab (wrapping) */
+static int UI_GetNextVisibleTab(int current)
+{
+    for (int i = 1; i <= 4; i++) {
+        int next = (current + i) % 4;
+        if (UI_IsActionTabVisible(next)) {
+            return next;
+        }
+    }
+    return current;  /* No other visible tab */
+}
+
+/* Helper: get previous visible tab (wrapping) */
+static int UI_GetPrevVisibleTab(int current)
+{
+    for (int i = 1; i <= 4; i++) {
+        int prev = (current - i + 4) % 4;
+        if (UI_IsActionTabVisible(prev)) {
+            return prev;
+        }
+    }
+    return current;  /* No other visible tab */
+}
+
+/* Helper: get currently active MappingOption table for the mapping dialog.
+ * Returns empty list if the active tab is hidden. */
 static void
 UI_GetActiveOptions(const UIState *state, const MappingOption **out_options, int *out_count)
 {
     if (!out_options || !out_count) {
+        return;
+    }
+
+    /* If the active tab is hidden, return empty */
+    if (!UI_IsActionTabVisible(state->active_tab)) {
+        *out_options = controller_options;  /* Just need a valid pointer */
+        *out_count = 0;
         return;
     }
 
@@ -1944,7 +2033,9 @@ static const int mouse_nav_right[MOUSE_NAV_TOTAL] = {
     /* 7:Wheel Down */   -1   /* right column - stay */
 };
 
-/* Handle back button press - navigate to previous page or close window */
+/* Handle back button press - navigate to previous page or close window.
+ * If we opened via quick-start mode (SDL_EditDeviceProfile or SDL_OpenDeviceProfilePage),
+ * pressing back on the entry page will close the UI instead of going back. */
 static void
 UI_HandleBack(UIState *state, bool *done)
 {
@@ -1957,10 +2048,20 @@ UI_HandleBack(UIState *state, bool *done)
         *done = true;
         break;
     case PAGE_PROFILE_SELECT:
-        state->current_page = PAGE_DEVICE_SELECT;
+        /* If this was our entry page, close; otherwise go back to device page */
+        if (g_active_entry_page == PAGE_PROFILE_SELECT) {
+            *done = true;
+        } else {
+            state->current_page = PAGE_DEVICE_SELECT;
+        }
         break;
     case PAGE_BUTTON_MAPPING:
-        state->current_page = PAGE_PROFILE_SELECT;
+        /* If this was our entry page, close; otherwise go back to profile page */
+        if (g_active_entry_page == PAGE_BUTTON_MAPPING) {
+            *done = true;
+        } else {
+            state->current_page = PAGE_PROFILE_SELECT;
+        }
         break;
     }
 }
@@ -2089,17 +2190,11 @@ UI_HandleGamepadNavButton(SDL_RemapperContext *ctx,
                     state->list_scroll = state->list_selection - 4;
                 }
             } else if (button == SDL_GAMEPAD_BUTTON_DPAD_LEFT) {
-                state->active_tab--;
-                if (state->active_tab < 0) {
-                    state->active_tab = 3;
-                }
+                state->active_tab = UI_GetPrevVisibleTab(state->active_tab);
                 state->list_selection = 0;
                 state->list_scroll = 0;
             } else if (button == SDL_GAMEPAD_BUTTON_DPAD_RIGHT) {
-                state->active_tab++;
-                if (state->active_tab > 3) {
-                    state->active_tab = 0;
-                }
+                state->active_tab = UI_GetNextVisibleTab(state->active_tab);
                 state->list_selection = 0;
                 state->list_scroll = 0;
             } else if (button == SDL_GAMEPAD_BUTTON_SOUTH) {
@@ -3568,8 +3663,8 @@ UI_InitDeviceList(UIState *state, SDL_JoystickID default_gamepad_id)
     state->active_mouse_id = 0;
     state->active_keyboard_id = 0;
 
-    /* Gamepads */
-    {
+    /* Gamepads - only show if config allows */
+    if (g_ui_config.show_gamepad_device) {
         int gp_count = 0;
         SDL_JoystickID *gamepad_ids = SDL_GetGamepads(&gp_count);
         if (gamepad_ids) {
@@ -3599,8 +3694,8 @@ UI_InitDeviceList(UIState *state, SDL_JoystickID default_gamepad_id)
         }
     }
 
-    /* Keyboard (aggregate) */
-    if (state->device_count < SDL_UI_MAX_DEVICES && SDL_HasKeyboard()) {
+    /* Keyboard (aggregate) - only show if config allows */
+    if (g_ui_config.show_keyboard_device && state->device_count < SDL_UI_MAX_DEVICES && SDL_HasKeyboard()) {
         int idx = state->device_count++;
         state->device_types[idx] = UI_DEVICE_TYPE_KEYBOARD;
         SDL_strlcpy(state->device_labels[idx], "Keyboard", sizeof(state->device_labels[idx]));
@@ -3619,8 +3714,8 @@ UI_InitDeviceList(UIState *state, SDL_JoystickID default_gamepad_id)
         }
     }
 
-    /* Mouse (aggregate) */
-    if (state->device_count < SDL_UI_MAX_DEVICES && SDL_HasMouse()) {
+    /* Mouse (aggregate) - only show if config allows */
+    if (g_ui_config.show_mouse_device && state->device_count < SDL_UI_MAX_DEVICES && SDL_HasMouse()) {
         int idx = state->device_count++;
         state->device_types[idx] = UI_DEVICE_TYPE_MOUSE;
         SDL_strlcpy(state->device_labels[idx], "Mouse", sizeof(state->device_labels[idx]));
@@ -5249,21 +5344,30 @@ static void DrawStickConfigDialog(SDL_Renderer *r, UIState *state, int w, int h)
     SDL_RenderFillRect(r, &overlay);
 
     float dw = 600.0f;
-    float base_dh = 660.0f;
+    float row_h = 32.0f;
+
+    /* Count visible checkboxes to calculate dialog height */
+    int visible_checkboxes = 2;  /* Invert X/Y always visible */
+    if (g_ui_config.show_stick_keyboard_options) visible_checkboxes += 2;  /* WASD + Arrow Keys */
+    if (g_ui_config.show_stick_mouse_option) visible_checkboxes += 1;      /* Mouse */
+    if (g_ui_config.show_stick_gamepad_options) visible_checkboxes += 2;   /* Controller Stick + D-Pad */
+    if (g_ui_config.show_stick_gyro_option) visible_checkboxes += 1;       /* Gyro */
+    if (g_ui_config.show_stick_touch_option) visible_checkboxes += 1;      /* Touch Mouse */
 
     /* Calculate extra height for sub-options that appear on their own rows */
     float extra_height = 0.0f;
-    float row_h = 32.0f;
-    if (state->stick_controller) {
+    if (g_ui_config.show_stick_gamepad_options && state->stick_controller) {
         extra_height += row_h;  /* Controller stick target row (Left/Right) */
     }
-    if (state->stick_gyro) {
+    if (g_ui_config.show_stick_gyro_option && state->stick_gyro) {
         extra_height += row_h;  /* Gyro mode row (Pitch/Yaw, Roll) */
     }
-    if (state->stick_touch_mouse) {
+    if (g_ui_config.show_stick_touch_option && state->stick_touch_mouse) {
         extra_height += row_h;  /* Touch finger row (First, Second) */
     }
 
+    /* Base height includes: title, checkboxes, sliders, buttons */
+    float base_dh = 90.0f + (visible_checkboxes * row_h) + 34.0f + (4 * 48.0f) + 60.0f + 40.0f;
     float dh = base_dh + extra_height;
     float dx = (w - dw) / 2.0f;
     float dy = (h - dh) / 2.0f;
@@ -5277,12 +5381,12 @@ static void DrawStickConfigDialog(SDL_Renderer *r, UIState *state, int w, int h)
     float cb_y = dy + 90.0f;
     float cb_size = 18.0f;
 
-    /* Helper macro for checkbox drawing with focus highlighting */
+    /* Helper macro for checkbox drawing with focus highlighting.
+     * cb_index tracks the logical index for focus, incremented for each visible checkbox */
     int cb_index = 0;
 #define DRAW_STICK_CHECK(label, enabled) \
     do { \
         bool cb_focused = (focus == cb_index); \
-        /* Draw grey highlight border if focused */ \
         if (cb_focused) { \
             DrawRoundedRect(r, cb_x - 4.0f, cb_y - 4.0f, cb_size + 8.0f, cb_size + 8.0f, 80, 80, 80, 255, true); \
         } \
@@ -5299,240 +5403,211 @@ static void DrawStickConfigDialog(SDL_Renderer *r, UIState *state, int w, int h)
         cb_index++; \
     } while (0)
 
-    DRAW_STICK_CHECK("Use as WASD", state->stick_wasd);
-    DRAW_STICK_CHECK("Use as Arrow Keys", state->stick_arrows);
-    DRAW_STICK_CHECK("Use as Mouse", state->stick_mouse);
-    DRAW_STICK_CHECK("Use as Controller Stick", state->stick_controller);
-    /* Controller stick toggle (Left <-> Right), shown on its own row when Controller Stick is enabled */
-    if (state->stick_controller) {
-        float toggle_y = cb_y + 2.0f;
-        float toggle_indent = 30.0f;
-        float toggle_w = 44.0f;
-        float toggle_h = 20.0f;
-        float toggle_x = cb_x + toggle_indent;
-        float knob_r = 8.0f;
-        bool is_right = (state->stick_controller_target == 1);
-
-        /* Toggle track */
-        DrawRoundedRect(r, toggle_x, toggle_y, toggle_w, toggle_h, 50, 50, 50, 255, true);
-
-        /* Toggle knob position */
-        float knob_x = is_right
-            ? toggle_x + toggle_w - knob_r - 4.0f
-            : toggle_x + knob_r + 4.0f;
-        float knob_y = toggle_y + toggle_h / 2.0f;
-
-        /* Knob */
-        SDL_SetRenderDrawColor(r, 180, 180, 180, 255);
-        for (int dy = -(int)knob_r; dy <= (int)knob_r; dy++) {
-            for (int ddx = -(int)knob_r; ddx <= (int)knob_r; ddx++) {
-                if (ddx * ddx + dy * dy <= (int)(knob_r * knob_r)) {
-                    SDL_RenderPoint(r, knob_x + (float)ddx, knob_y + (float)dy);
-                }
-            }
-        }
-
-        /* Show only the active option label */
-        const char *stick_label = is_right ? "Right Stick" : "Left Stick";
-        DrawTextLeft(r, stick_label, toggle_x + toggle_w + 12.0f,
-                     toggle_y + toggle_h * 0.65f, 16.0f, 200, 200, 200, 255);
-
-        cb_y += row_h;
+    /* Keyboard options */
+    if (g_ui_config.show_stick_keyboard_options) {
+        DRAW_STICK_CHECK("Use as WASD", state->stick_wasd);
+        DRAW_STICK_CHECK("Use as Arrow Keys", state->stick_arrows);
     }
 
+    /* Mouse option */
+    if (g_ui_config.show_stick_mouse_option) {
+        DRAW_STICK_CHECK("Use as Mouse", state->stick_mouse);
+    }
+
+    /* Gamepad options */
+    if (g_ui_config.show_stick_gamepad_options) {
+        DRAW_STICK_CHECK("Use as Controller Stick", state->stick_controller);
+        /* Controller stick toggle (Left <-> Right), shown on its own row when Controller Stick is enabled */
+        if (state->stick_controller) {
+            float toggle_y = cb_y + 2.0f;
+            float toggle_indent = 30.0f;
+            float toggle_w = 44.0f;
+            float toggle_h = 20.0f;
+            float toggle_x = cb_x + toggle_indent;
+            float knob_r = 8.0f;
+            bool is_right = (state->stick_controller_target == 1);
+
+            DrawRoundedRect(r, toggle_x, toggle_y, toggle_w, toggle_h, 50, 50, 50, 255, true);
+            float knob_x = is_right ? toggle_x + toggle_w - knob_r - 4.0f : toggle_x + knob_r + 4.0f;
+            float knob_y = toggle_y + toggle_h / 2.0f;
+
+            SDL_SetRenderDrawColor(r, 180, 180, 180, 255);
+            for (int ky = -(int)knob_r; ky <= (int)knob_r; ky++) {
+                for (int kx = -(int)knob_r; kx <= (int)knob_r; kx++) {
+                    if (kx * kx + ky * ky <= (int)(knob_r * knob_r)) {
+                        SDL_RenderPoint(r, knob_x + (float)kx, knob_y + (float)ky);
+                    }
+                }
+            }
+            const char *stick_label = is_right ? "Right Stick" : "Left Stick";
+            DrawTextLeft(r, stick_label, toggle_x + toggle_w + 12.0f, toggle_y + toggle_h * 0.65f, 16.0f, 200, 200, 200, 255);
+            cb_y += row_h;
+        }
         DRAW_STICK_CHECK("Use as Controller D-Pad", state->stick_dpad);
-    DRAW_STICK_CHECK("Use as Gyroscope", state->stick_gyro);
-
-    /* Gyro mode toggle (Pitch/Yaw <-> Roll), shown on its own row when Gyroscope is enabled */
-    if (state->stick_gyro) {
-        float toggle_y = cb_y + 2.0f;
-        float toggle_indent = 30.0f;
-        float toggle_w = 44.0f;
-        float toggle_h = 20.0f;
-        float toggle_x = cb_x + toggle_indent;
-        float knob_r = 8.0f;
-
-        /* Toggle track */
-        DrawRoundedRect(r, toggle_x, toggle_y, toggle_w, toggle_h, 50, 50, 50, 255, true);
-
-        /* Toggle knob position */
-        float knob_x = state->stick_gyro_mode_roll
-            ? toggle_x + toggle_w - knob_r - 4.0f
-            : toggle_x + knob_r + 4.0f;
-        float knob_y = toggle_y + toggle_h / 2.0f;
-
-        /* Knob */
-        SDL_SetRenderDrawColor(r, 180, 180, 180, 255);
-        for (int dy = -(int)knob_r; dy <= (int)knob_r; dy++) {
-            for (int ddx = -(int)knob_r; ddx <= (int)knob_r; ddx++) {
-                if (ddx * ddx + dy * dy <= (int)(knob_r * knob_r)) {
-                    SDL_RenderPoint(r, knob_x + (float)ddx, knob_y + (float)dy);
-                }
-            }
-        }
-
-        /* Show only the active option label */
-        const char *gyro_label = state->stick_gyro_mode_roll ? "Roll" : "Pitch/Yaw";
-        DrawTextLeft(r, gyro_label, toggle_x + toggle_w + 12.0f,
-                     toggle_y + toggle_h * 0.65f, 16.0f, 200, 200, 200, 255);
-
-        cb_y += row_h;
     }
 
-    DRAW_STICK_CHECK("Use as Touch Mouse", state->stick_touch_mouse);
+    /* Gyro option */
+    if (g_ui_config.show_stick_gyro_option) {
+        DRAW_STICK_CHECK("Use as Gyroscope", state->stick_gyro);
+        /* Gyro mode toggle (Pitch/Yaw <-> Roll), shown on its own row when Gyroscope is enabled */
+        if (state->stick_gyro) {
+            float toggle_y = cb_y + 2.0f;
+            float toggle_indent = 30.0f;
+            float toggle_w = 44.0f;
+            float toggle_h = 20.0f;
+            float toggle_x = cb_x + toggle_indent;
+            float knob_r = 8.0f;
 
-    /* Touch finger toggle (First <-> Second), shown on its own row when Touch Mouse is enabled */
-    if (state->stick_touch_mouse) {
-        float toggle_y = cb_y + 2.0f;
-        float toggle_indent = 30.0f;
-        float toggle_w = 44.0f;
-        float toggle_h = 20.0f;
-        float toggle_x = cb_x + toggle_indent;
-        float knob_r = 8.0f;
-        bool is_second = (state->stick_touch_finger == 2);
+            DrawRoundedRect(r, toggle_x, toggle_y, toggle_w, toggle_h, 50, 50, 50, 255, true);
+            float knob_x = state->stick_gyro_mode_roll ? toggle_x + toggle_w - knob_r - 4.0f : toggle_x + knob_r + 4.0f;
+            float knob_y = toggle_y + toggle_h / 2.0f;
 
-        /* Toggle track */
-        DrawRoundedRect(r, toggle_x, toggle_y, toggle_w, toggle_h, 50, 50, 50, 255, true);
-
-        /* Toggle knob position */
-        float knob_x = is_second
-            ? toggle_x + toggle_w - knob_r - 4.0f
-            : toggle_x + knob_r + 4.0f;
-        float knob_y = toggle_y + toggle_h / 2.0f;
-
-        /* Knob */
-        SDL_SetRenderDrawColor(r, 180, 180, 180, 255);
-        for (int dy = -(int)knob_r; dy <= (int)knob_r; dy++) {
-            for (int ddx = -(int)knob_r; ddx <= (int)knob_r; ddx++) {
-                if (ddx * ddx + dy * dy <= (int)(knob_r * knob_r)) {
-                    SDL_RenderPoint(r, knob_x + (float)ddx, knob_y + (float)dy);
+            SDL_SetRenderDrawColor(r, 180, 180, 180, 255);
+            for (int ky = -(int)knob_r; ky <= (int)knob_r; ky++) {
+                for (int kx = -(int)knob_r; kx <= (int)knob_r; kx++) {
+                    if (kx * kx + ky * ky <= (int)(knob_r * knob_r)) {
+                        SDL_RenderPoint(r, knob_x + (float)kx, knob_y + (float)ky);
+                    }
                 }
             }
+            const char *gyro_label = state->stick_gyro_mode_roll ? "Roll" : "Pitch/Yaw";
+            DrawTextLeft(r, gyro_label, toggle_x + toggle_w + 12.0f, toggle_y + toggle_h * 0.65f, 16.0f, 200, 200, 200, 255);
+            cb_y += row_h;
         }
-
-        /* Show only the active option label */
-        const char *finger_label = is_second ? "Second Finger" : "First Finger";
-        DrawTextLeft(r, finger_label, toggle_x + toggle_w + 12.0f,
-                     toggle_y + toggle_h * 0.65f, 16.0f, 200, 200, 200, 255);
-
-        cb_y += row_h;
     }
 
+    /* Touch option */
+    if (g_ui_config.show_stick_touch_option) {
+        DRAW_STICK_CHECK("Use as Touch Mouse", state->stick_touch_mouse);
+        /* Touch finger toggle (First <-> Second), shown on its own row when Touch Mouse is enabled */
+        if (state->stick_touch_mouse) {
+            float toggle_y = cb_y + 2.0f;
+            float toggle_indent = 30.0f;
+            float toggle_w = 44.0f;
+            float toggle_h = 20.0f;
+            float toggle_x = cb_x + toggle_indent;
+            float knob_r = 8.0f;
+            bool is_second = (state->stick_touch_finger == 2);
+
+            DrawRoundedRect(r, toggle_x, toggle_y, toggle_w, toggle_h, 50, 50, 50, 255, true);
+            float knob_x = is_second ? toggle_x + toggle_w - knob_r - 4.0f : toggle_x + knob_r + 4.0f;
+            float knob_y = toggle_y + toggle_h / 2.0f;
+
+            SDL_SetRenderDrawColor(r, 180, 180, 180, 255);
+            for (int ky = -(int)knob_r; ky <= (int)knob_r; ky++) {
+                for (int kx = -(int)knob_r; kx <= (int)knob_r; kx++) {
+                    if (kx * kx + ky * ky <= (int)(knob_r * knob_r)) {
+                        SDL_RenderPoint(r, knob_x + (float)kx, knob_y + (float)ky);
+                    }
+                }
+            }
+            const char *finger_label = is_second ? "Second Finger" : "First Finger";
+            DrawTextLeft(r, finger_label, toggle_x + toggle_w + 12.0f, toggle_y + toggle_h * 0.65f, 16.0f, 200, 200, 200, 255);
+            cb_y += row_h;
+        }
+    }
+
+    /* Invert options - always visible */
     DRAW_STICK_CHECK("Invert Horizontal Axis", state->stick_invert_x);
     DRAW_STICK_CHECK("Invert Vertical Axis", state->stick_invert_y);
 
 #undef DRAW_STICK_CHECK
 
-    /* Sliders for sensitivity and acceleration - use fill style like trigger dialog.
-     * When Gyroscope mode is enabled, use dedicated gyro sliders instead of the
-     * generic mouse-style sensitivity/acceleration controls. */
+    /* Track slider focus index - continues from checkbox count */
+    int slider_focus_base = cb_index;
+
+    /* Sliders for sensitivity and acceleration */
     float slider_x = dx + 40.0f;
     float slider_w = dw - 80.0f;
     float slider_h = 12.0f;
-    float slider_y = cb_y + 34.0f;  /* small blank gap after last checkbox */
+    float slider_y = cb_y + 34.0f;
 
-    if (state->stick_gyro) {
-        /* Gyro Horizontal Sensitivity - focus index 9 */
-        bool gh_sens_focused = (focus == 9);
+    if (g_ui_config.show_stick_gyro_option && state->stick_gyro) {
+        /* Gyro sliders */
+        bool gh_sens_focused = (focus == slider_focus_base);
         DrawTextLeft(r, "Gyro Horizontal Sensitivity", slider_x, slider_y - 12.0f, 18.0f, 255, 255, 255, 255);
         DrawRoundedRect(r, slider_x, slider_y, slider_w, slider_h, 48, 48, 48, 255, true);
         {
             float t = (state->stick_gyro_h_sens + 50.0f) / 100.0f;
-            if (t < 0.0f) t = 0.0f;
-            if (t > 1.0f) t = 1.0f;
-            float fill_w = slider_w * t;
+            if (t < 0.0f) t = 0.0f; if (t > 1.0f) t = 1.0f;
             Uint8 fill_grey = gh_sens_focused ? 140 : 100;
-            DrawRoundedRect(r, slider_x, slider_y, fill_w, slider_h, fill_grey, fill_grey, fill_grey, 255, true);
+            DrawRoundedRect(r, slider_x, slider_y, slider_w * t, slider_h, fill_grey, fill_grey, fill_grey, 255, true);
         }
         slider_y += 48.0f;
 
-        /* Gyro Vertical Sensitivity - focus index 10 */
-        bool gv_sens_focused = (focus == 10);
+        bool gv_sens_focused = (focus == slider_focus_base + 1);
         DrawTextLeft(r, "Gyro Vertical Sensitivity", slider_x, slider_y - 12.0f, 18.0f, 255, 255, 255, 255);
         DrawRoundedRect(r, slider_x, slider_y, slider_w, slider_h, 48, 48, 48, 255, true);
         {
             float t = (state->stick_gyro_v_sens + 50.0f) / 100.0f;
-            if (t < 0.0f) t = 0.0f;
-            if (t > 1.0f) t = 1.0f;
-            float fill_w = slider_w * t;
+            if (t < 0.0f) t = 0.0f; if (t > 1.0f) t = 1.0f;
             Uint8 fill_grey = gv_sens_focused ? 140 : 100;
-            DrawRoundedRect(r, slider_x, slider_y, fill_w, slider_h, fill_grey, fill_grey, fill_grey, 255, true);
+            DrawRoundedRect(r, slider_x, slider_y, slider_w * t, slider_h, fill_grey, fill_grey, fill_grey, 255, true);
         }
         slider_y += 48.0f;
 
-        /* Gyro Acceleration - focus index 11 */
-        bool g_accel_focused = (focus == 11);
+        bool g_accel_focused = (focus == slider_focus_base + 2);
         DrawTextLeft(r, "Gyro Acceleration", slider_x, slider_y - 12.0f, 18.0f, 255, 255, 255, 255);
         DrawRoundedRect(r, slider_x, slider_y, slider_w, slider_h, 48, 48, 48, 255, true);
         {
             float t = (state->stick_gyro_accel + 50.0f) / 100.0f;
-            if (t < 0.0f) t = 0.0f;
-            if (t > 1.0f) t = 1.0f;
-            float fill_w = slider_w * t;
+            if (t < 0.0f) t = 0.0f; if (t > 1.0f) t = 1.0f;
             Uint8 fill_grey = g_accel_focused ? 140 : 100;
-            DrawRoundedRect(r, slider_x, slider_y, fill_w, slider_h, fill_grey, fill_grey, fill_grey, 255, true);
+            DrawRoundedRect(r, slider_x, slider_y, slider_w * t, slider_h, fill_grey, fill_grey, fill_grey, 255, true);
         }
+        slider_y += 48.0f;
+        /* Placeholder fourth slider position for consistent button placement */
+        slider_y += 48.0f;
     } else {
-        /* Generic mouse-style sensitivity / acceleration sliders */
-        /* Horizontal Sensitivity - focus index 9 */
-        bool h_sens_focused = (focus == 9);
+        /* Generic mouse-style sliders */
+        bool h_sens_focused = (focus == slider_focus_base);
         DrawTextLeft(r, "Horizontal Sensitivity", slider_x, slider_y - 12.0f, 18.0f, 255, 255, 255, 255);
         DrawRoundedRect(r, slider_x, slider_y, slider_w, slider_h, 48, 48, 48, 255, true);
         {
             float t = (state->stick_h_sens + 50.0f) / 100.0f;
-            if (t < 0.0f) t = 0.0f;
-            if (t > 1.0f) t = 1.0f;
-            float fill_w = slider_w * t;
+            if (t < 0.0f) t = 0.0f; if (t > 1.0f) t = 1.0f;
             Uint8 fill_grey = h_sens_focused ? 140 : 100;
-            DrawRoundedRect(r, slider_x, slider_y, fill_w, slider_h, fill_grey, fill_grey, fill_grey, 255, true);
+            DrawRoundedRect(r, slider_x, slider_y, slider_w * t, slider_h, fill_grey, fill_grey, fill_grey, 255, true);
         }
         slider_y += 48.0f;
 
-        /* Vertical Sensitivity - focus index 10 */
-        bool v_sens_focused = (focus == 10);
+        bool v_sens_focused = (focus == slider_focus_base + 1);
         DrawTextLeft(r, "Vertical Sensitivity", slider_x, slider_y - 12.0f, 18.0f, 255, 255, 255, 255);
         DrawRoundedRect(r, slider_x, slider_y, slider_w, slider_h, 48, 48, 48, 255, true);
         {
             float t = (state->stick_v_sens + 50.0f) / 100.0f;
-            if (t < 0.0f) t = 0.0f;
-            if (t > 1.0f) t = 1.0f;
-            float fill_w = slider_w * t;
+            if (t < 0.0f) t = 0.0f; if (t > 1.0f) t = 1.0f;
             Uint8 fill_grey = v_sens_focused ? 140 : 100;
-            DrawRoundedRect(r, slider_x, slider_y, fill_w, slider_h, fill_grey, fill_grey, fill_grey, 255, true);
+            DrawRoundedRect(r, slider_x, slider_y, slider_w * t, slider_h, fill_grey, fill_grey, fill_grey, 255, true);
         }
         slider_y += 48.0f;
 
-        /* Horizontal Acceleration - focus index 11 */
-        bool h_accel_focused = (focus == 11);
+        bool h_accel_focused = (focus == slider_focus_base + 2);
         DrawTextLeft(r, "Horizontal Acceleration", slider_x, slider_y - 12.0f, 18.0f, 255, 255, 255, 255);
         DrawRoundedRect(r, slider_x, slider_y, slider_w, slider_h, 48, 48, 48, 255, true);
         {
             float t = (state->stick_h_accel + 50.0f) / 100.0f;
-            if (t < 0.0f) t = 0.0f;
-            if (t > 1.0f) t = 1.0f;
-            float fill_w = slider_w * t;
+            if (t < 0.0f) t = 0.0f; if (t > 1.0f) t = 1.0f;
             Uint8 fill_grey = h_accel_focused ? 140 : 100;
-            DrawRoundedRect(r, slider_x, slider_y, fill_w, slider_h, fill_grey, fill_grey, fill_grey, 255, true);
+            DrawRoundedRect(r, slider_x, slider_y, slider_w * t, slider_h, fill_grey, fill_grey, fill_grey, 255, true);
         }
         slider_y += 48.0f;
 
-        /* Vertical Acceleration - focus index 12 */
-        bool v_accel_focused = (focus == 12);
+        bool v_accel_focused = (focus == slider_focus_base + 3);
         DrawTextLeft(r, "Vertical Acceleration", slider_x, slider_y - 12.0f, 18.0f, 255, 255, 255, 255);
         DrawRoundedRect(r, slider_x, slider_y, slider_w, slider_h, 48, 48, 48, 255, true);
         {
             float t = (state->stick_v_accel + 50.0f) / 100.0f;
-            if (t < 0.0f) t = 0.0f;
-            if (t > 1.0f) t = 1.0f;
-            float fill_w = slider_w * t;
+            if (t < 0.0f) t = 0.0f; if (t > 1.0f) t = 1.0f;
             Uint8 fill_grey = v_accel_focused ? 140 : 100;
-            DrawRoundedRect(r, slider_x, slider_y, fill_w, slider_h, fill_grey, fill_grey, fill_grey, 255, true);
+            DrawRoundedRect(r, slider_x, slider_y, slider_w * t, slider_h, fill_grey, fill_grey, fill_grey, 255, true);
         }
     }
 
-    /* Buttons - focus indices 13 and 14 */
-    bool ok_sel = (focus == 13);
-    bool cancel_sel2 = (focus == 14);
+    /* Buttons - focus indices after sliders */
+    int button_focus_base = slider_focus_base + 4;
+    bool ok_sel = (focus == button_focus_base);
+    bool cancel_sel2 = (focus == button_focus_base + 1);
     DrawButton(r, "OK", dx + dw - 220.0f, dy + dh - 60.0f, 80.0f, 40.0f, false, ok_sel);
     DrawButton(r, "Cancel", dx + dw - 120.0f, dy + dh - 60.0f, 100.0f, 40.0f, false, cancel_sel2);
 
@@ -5790,11 +5865,16 @@ static void DrawMappingSelectDialog(SDL_Renderer *r, UIState *state, int w, int 
     DrawRoundedRectEx(r, dx, dy, dw, dh, 33, 33, 33, 255, true, 4.0f);
     DrawText(r, "Select Mapping", dx + dw/2, dy + 40, 24, 255, 255, 255, 255);
 
-    /* Tabs */
+    /* Tabs - only show visible ones */
     const char *tabs[] = { "Controller", "Mouse", "Keyboard", "Touch" };
+    int tab_x_offset = 0;
     for (int i = 0; i < 4; i++) {
+        if (!UI_IsActionTabVisible(i)) {
+            continue;  /* Skip hidden tabs */
+        }
         bool selected = (i == state->active_tab);
-        DrawButton(r, tabs[i], dx + 20 + i * 130, dy + 80, 120, 40, false, selected);
+        DrawButton(r, tabs[i], dx + 20 + tab_x_offset * 130, dy + 80, 120, 40, false, selected);
+        tab_x_offset++;
     }
 
     /* List background */
@@ -5912,7 +5992,7 @@ int SDL_ShowGamepadRemappingWindow_REAL(SDL_RemapperContext *ctx, SDL_JoystickID
     state.selected_button = SDL_GAMEPAD_BUTTON_INVALID;
     state.selected_axis = SDL_GAMEPAD_AXIS_INVALID;
     state.active_dialog = DIALOG_NONE;
-    state.active_tab = 0;
+    state.active_tab = UI_GetFirstVisibleTab();
     state.active_slot = 0;
     state.list_selection = 0;
     state.list_scroll = 0;
@@ -5957,7 +6037,10 @@ int SDL_ShowGamepadRemappingWindow_REAL(SDL_RemapperContext *ctx, SDL_JoystickID
      * the currently selected profile to the remapper context. */
     UI_LoadProfilesFromDisk(ctx, active_gamepad_id, &state);
 
-    /* Quick-start edit mode: jump directly to mapping page for specific device/profile */
+    /* Default entry page (normal mode - device select page) */
+    g_active_entry_page = PAGE_DEVICE_SELECT;
+
+    /* Quick-start edit mode: jump directly to a specific page for specific device/profile */
     if (g_edit_mode_active) {
         /* Find the requested device type */
         for (int i = 0; i < state.device_count; i++) {
@@ -5987,12 +6070,14 @@ int SDL_ShowGamepadRemappingWindow_REAL(SDL_RemapperContext *ctx, SDL_JoystickID
             }
         }
 
-        /* Jump directly to the button mapping page */
-        state.current_page = PAGE_BUTTON_MAPPING;
+        /* Jump to the requested entry page and remember it for back button behavior */
+        state.current_page = g_edit_entry_page;
+        g_active_entry_page = g_edit_entry_page;
 
-        /* Clear the edit mode flag */
+        /* Clear the edit mode flags */
         g_edit_mode_active = false;
         g_edit_profile_name[0] = '\0';
+        g_edit_entry_page = PAGE_DEVICE_SELECT;
     }
 
     /* Use provided renderer or create our own window */
@@ -6077,11 +6162,24 @@ int SDL_ShowGamepadRemappingWindow_REAL(SDL_RemapperContext *ctx, SDL_JoystickID
             if (event.type == SDL_EVENT_QUIT) {
                 done = true;
             } else if (event.type == SDL_EVENT_KEY_DOWN) {
-                if (event.key.scancode == SDL_SCANCODE_ESCAPE) {
+                if (event.key.scancode == SDL_SCANCODE_ESCAPE ||
+                    event.key.scancode == SDL_SCANCODE_BACKSPACE) {
                     if (state.active_dialog != DIALOG_NONE) {
                         state.active_dialog = DIALOG_NONE;
                     } else if (state.current_page == PAGE_BUTTON_MAPPING) {
-                        state.current_page = PAGE_PROFILE_SELECT;
+                        /* If entry page was remapper, close UI; otherwise go to profile */
+                        if (g_active_entry_page == PAGE_BUTTON_MAPPING) {
+                            done = true;
+                        } else {
+                            state.current_page = PAGE_PROFILE_SELECT;
+                        }
+                    } else if (state.current_page == PAGE_PROFILE_SELECT) {
+                        /* If entry page was profile, close UI; otherwise go to device */
+                        if (g_active_entry_page == PAGE_PROFILE_SELECT) {
+                            done = true;
+                        } else {
+                            state.current_page = PAGE_DEVICE_SELECT;
+                        }
                     } else {
                         done = true;
                     }
@@ -6109,18 +6207,12 @@ int SDL_ShowGamepadRemappingWindow_REAL(SDL_RemapperContext *ctx, SDL_JoystickID
                         }
                     } else if (event.key.scancode == SDL_SCANCODE_LEFT) {
                         /* Switch tabs left */
-                        state.active_tab--;
-                        if (state.active_tab < 0) {
-                            state.active_tab = 3;
-                        }
+                        state.active_tab = UI_GetPrevVisibleTab(state.active_tab);
                         state.list_selection = 0;
                         state.list_scroll = 0;
                     } else if (event.key.scancode == SDL_SCANCODE_RIGHT) {
                         /* Switch tabs right */
-                        state.active_tab++;
-                        if (state.active_tab > 3) {
-                            state.active_tab = 0;
-                        }
+                        state.active_tab = UI_GetNextVisibleTab(state.active_tab);
                         state.list_selection = 0;
                         state.list_scroll = 0;
                     } else if (event.key.scancode == SDL_SCANCODE_RETURN && option_count > 0) {
@@ -7690,16 +7782,15 @@ int SDL_ShowGamepadRemappingWindow_REAL(SDL_RemapperContext *ctx, SDL_JoystickID
 }
 
 /* Edit a specific profile directly - for "Edit Controls" buttons.
- * This sets flags and calls the full UI which will jump to the correct page. */
+ * This sets flags and calls the full UI which will jump to the remapping page.
+ * Back button on remapping page will close the UI.
+ * If profile_name is NULL or empty, uses the current/default profile. */
 int SDL_EditDeviceProfile_REAL(SDL_RemapperContext *ctx, SDL_RemapperDeviceType device_type,
                                 SDL_Renderer *renderer, const char *profile_name)
 {
-    if (!profile_name || !*profile_name) {
-        return SDL_InvalidParamError("profile_name");
-    }
-
     /* Set quick-start flags */
     g_edit_mode_active = true;
+    g_edit_entry_page = PAGE_BUTTON_MAPPING;  /* Entry at remapping page - back closes UI */
 
     switch (device_type) {
     case SDL_REMAPPER_DEVICE_MOUSE:
@@ -7714,7 +7805,46 @@ int SDL_EditDeviceProfile_REAL(SDL_RemapperContext *ctx, SDL_RemapperDeviceType 
         break;
     }
 
-    SDL_strlcpy(g_edit_profile_name, profile_name, sizeof(g_edit_profile_name));
+    /* If profile specified, search for it; otherwise use default */
+    if (profile_name && *profile_name) {
+        SDL_strlcpy(g_edit_profile_name, profile_name, sizeof(g_edit_profile_name));
+    } else {
+        g_edit_profile_name[0] = '\0';  /* Empty = use default/current profile */
+    }
+
+    /* Call the full UI - it will use the flags to jump to the right place */
+    return SDL_ShowGamepadRemappingWindow(ctx, 0, renderer);
+}
+
+/* Open the profile page directly - for profile management.
+ * Back button on profile page will close the UI, but back on remapping goes to profile.
+ * If profile_name is NULL or empty, uses the current/default profile. */
+int SDL_OpenDeviceProfilePage_REAL(SDL_RemapperContext *ctx, SDL_RemapperDeviceType device_type,
+                                    SDL_Renderer *renderer, const char *profile_name)
+{
+    /* Set quick-start flags */
+    g_edit_mode_active = true;
+    g_edit_entry_page = PAGE_PROFILE_SELECT;  /* Entry at profile page - back closes UI */
+
+    switch (device_type) {
+    case SDL_REMAPPER_DEVICE_MOUSE:
+        g_edit_device_type = UI_DEVICE_TYPE_MOUSE;
+        break;
+    case SDL_REMAPPER_DEVICE_KEYBOARD:
+        g_edit_device_type = UI_DEVICE_TYPE_KEYBOARD;
+        break;
+    case SDL_REMAPPER_DEVICE_GAMEPAD:
+    default:
+        g_edit_device_type = UI_DEVICE_TYPE_GAMEPAD;
+        break;
+    }
+
+    /* If profile specified, search for it; otherwise use default */
+    if (profile_name && *profile_name) {
+        SDL_strlcpy(g_edit_profile_name, profile_name, sizeof(g_edit_profile_name));
+    } else {
+        g_edit_profile_name[0] = '\0';  /* Empty = use default/current profile */
+    }
 
     /* Call the full UI - it will use the flags to jump to the right place */
     return SDL_ShowGamepadRemappingWindow(ctx, 0, renderer);
@@ -7726,6 +7856,46 @@ int SDL_EditGamepadProfile_REAL(SDL_RemapperContext *ctx, SDL_JoystickID gamepad
 {
     (void)gamepad_id;  /* Not used - device is determined by device_type */
     return SDL_EditDeviceProfile(ctx, SDL_REMAPPER_DEVICE_GAMEPAD, renderer, profile_name);
+}
+
+/* ===== UI Visibility Configuration API ===== */
+
+void SDL_GetDefaultRemapperUIConfig_REAL(SDL_RemapperUIConfig *config)
+{
+    if (!config) {
+        return;
+    }
+    /* Device Selection Page */
+    config->show_gamepad_device = true;
+    config->show_mouse_device = true;
+    config->show_keyboard_device = true;
+    config->show_touch_device = true;
+    /* Action Lists (tabs in mapping dialog) */
+    config->show_gamepad_actions = true;
+    config->show_mouse_actions = true;
+    config->show_keyboard_actions = true;
+    config->show_touch_actions = true;
+    /* Stick/Mouse Movement Dialog Options */
+    config->show_stick_mouse_option = true;
+    config->show_stick_keyboard_options = true;
+    config->show_stick_gamepad_options = true;
+    config->show_stick_touch_option = true;
+    config->show_stick_gyro_option = true;
+}
+
+void SDL_SetRemapperUIConfig_REAL(const SDL_RemapperUIConfig *config)
+{
+    if (config) {
+        g_ui_config = *config;
+    } else {
+        /* Reset to defaults */
+        SDL_GetDefaultRemapperUIConfig(&g_ui_config);
+    }
+}
+
+const SDL_RemapperUIConfig * SDL_GetRemapperUIConfig_REAL(void)
+{
+    return &g_ui_config;
 }
 
 /* ===== Advanced Overlay API Implementation ===== */
@@ -7762,7 +7932,7 @@ SDL_RemapperUI * SDLCALL SDL_CreateRemapperUI_REAL(SDL_RemapperContext *ctx, SDL
     ui->state.selected_button = SDL_GAMEPAD_BUTTON_INVALID;
     ui->state.selected_axis = SDL_GAMEPAD_AXIS_INVALID;
     ui->state.active_dialog = DIALOG_NONE;
-    ui->state.active_tab = 0;
+    ui->state.active_tab = UI_GetFirstVisibleTab();
     ui->state.active_slot = 0;
     ui->state.list_selection = 0;
     ui->state.list_scroll = 0;
